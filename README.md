@@ -42,11 +42,22 @@ Arrow keys map to `w`/`a`/`s`/`d`. On-screen buttons work too.
 | `game/envs.json` | which games are available |
 | `game/<game>.wasm` | one module per game, from `tinyworldformer-rs/web/build.sh` |
 | `game/serve.sh` | restart-on-exit static server for port 12000 |
-| `.github/workflows/pages.yml` | publishes `game/` to GitHub Pages |
+| `gh-pages` branch | the built site at its root; GitHub Pages serves it |
+
+## Rendering
+
+The engine emits one colour per grid cell (16×20 up to 48×48). The page does not just
+upscale those cells: it reads the raw token grid (a `grid()` export added to
+`web/src/lib.rs`) and redraws every frame at display resolution — gradients for the
+pong court, flappy sky and doom-lite ceiling/floor, crisp structure for walls, pipes
+and pellets, and real sprites for the ball, bird, Pac-Man and the ghosts. Colours come
+from the frame itself, so the palette stays the one the model was trained on. A canvas
+is sized to a whole number of device pixels per cell, so the browser never rescales it.
 
 ## Rebuilding
 
-The `.wasm` files are build output from the upstream repo. To reproduce them:
+The `.wasm` files are build output from the upstream repo, plus the `grid()` export.
+To reproduce them:
 
 ```bash
 git clone https://github.com/SheepSeb/tinyworldformer
