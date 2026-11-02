@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>tinyworldformer</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='14' fill='%23ffde1e'/%3E%3Cpath d='M16 16 L32 7 A14 14 0 0 1 32 25 Z' fill='%23111113'/%3E%3C/svg%3E">
 <style>
   :root { --bg: #f6f5f2; --fg: #1d1d1f; --muted: #6b6b70; --line: #d9d8d3; --btn: #ffffff; --accent: #c2410c; }
   @media (prefers-color-scheme: dark) { :root { --bg: #111113; --fg: #ececee; --muted: #9a9aa2; --line: #2c2c31; --btn: #1c1c20; --accent: #fb923c; } }
@@ -15,7 +16,7 @@
   .bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px; }
   select, button { font: inherit; color: var(--fg); background: var(--btn); border: 1px solid var(--line); border-radius: 8px; padding: 6px 12px; cursor: pointer; }
   button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
-  canvas { display: block; width: 100%; max-width: 560px; margin: 0 auto; image-rendering: pixelated; border-radius: 6px; background: #000; touch-action: none; }
+  canvas { display: block; width: 100%; max-width: 560px; margin: 0 auto; border-radius: 8px; background: #000; touch-action: none; box-shadow: 0 1px 3px rgba(0,0,0,.35), 0 8px 28px -12px rgba(0,0,0,.5); }
   .stats { font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; margin: 12px 0; white-space: pre-wrap; min-height: 3em; }
   .keys { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin: 12px 0; }
   .keys button { min-width: 64px; padding: 10px 14px; }
@@ -54,7 +55,227 @@ const ARROWS = { ArrowUp: 'w', ArrowLeft: 'a', ArrowDown: 's', ArrowRight: 'd' }
 
 const $ = id => document.getElementById(id);
 const screen = $('screen'), ctx = screen.getContext('2d');
-let wasm = null, game = '', fast = false, lastStep = 0, modelMs = 0, generation = 0;
+let wasm = null, game = '', fast = false, lastStep = 0, modelMs = 0, generation = 0, scale = 8;
+
+// ---------- HD renderer ------------------------------------------------------------------
+// The engine emits one colour per grid cell (16x20 .. 48x48). Blowing those cells up with
+// `image-rendering: pixelated` gives large, uneven blocks, so the page reads the raw token grid
+// and redraws each frame at display resolution: smooth gradients for sky/court/ceiling, crisp
+// structure for walls/pipes/pellets, and real sprites for the ball, bird, Pac-Man and ghosts.
+// Colours come from the frame itself, so the palette stays the one the model was trained on.
+
+const PAL = {
+  breakout: { wall: '#5a5a5a', paddle: '#3c8cdc', ball: '#ffffff' },
+  pong: { wall: '#c8c8d2', net: '#464b5a', me: '#50aaff', cpu: '#ff5a50', hud: '#16161c',
+          slotP: '#283c5a', slotC: '#5a2828' },
+  flappy: { bush: '#55b446', grass: '#78d250', pipe: '#5fbe3c', pipeEdge: '#3c8728', pipeCap: '#8ce15a',
+            hud: '#1e1e24', beak: '#fa7828', marker: '#ffffff', bird: '#ffd732' },
+  doomlite: { enemy: '#be2d23', eye: '#ffe63c', gun: '#37373c', gunHi: '#9696a0', hud: '#141418',
+              health: '#3cd25a', mapWall: '#8c8c8c', mapFloor: '#282830', mapEnemy: '#f03232',
+              mapPlayer: '#5aaaff' },
+  pacman: { wallFill: '#10165a', pellet: '#ffc8a0', hud: '#121216', body: '#ffde1e', eye: '#2b2b2b',
+            ghostA: '#f01e1e', ghostB: '#ff8cd2', pupil: '#2b3cc8' },
+};
+
+const px3 = (rgba, i) => `rgb(${rgba[i * 4]},${rgba[i * 4 + 1]},${rgba[i * 4 + 2]})`;
+
+// Rounded rectangles are what make the sprites read as shapes rather than blocks; polyfill the
+// path for engines that predate `roundRect`.
+if (!CanvasRenderingContext2D.prototype.roundRect) {
+  CanvasRenderingContext2D.prototype.roundRect = function (x, y, w, h, r) {
+    r = Math.min(r, w / 2, h / 2);
+    this.moveTo(x + r, y);
+    this.arcTo(x + w, y, x + w, y + h, r); this.arcTo(x + w, y + h, x, y + h, r);
+    this.arcTo(x, y + h, x, y, r); this.arcTo(x, y, x + w, y, r);
+    this.closePath();
+  };
+}
+
+function box(c, x, y, w, h, fill, rad) {
+  c.beginPath();
+  if (rad) c.roundRect(x, y, w, h, rad); else c.rect(x, y, w, h);
+  c.fillStyle = fill; c.fill();
+}
+function disc(c, x, y, r, fill, glow) {
+  if (glow) { c.save(); c.shadowColor = glow; c.shadowBlur = r * 1.8; }
+  c.beginPath(); c.arc(x, y, r, 0, 7); c.fillStyle = fill; c.fill();
+  if (glow) c.restore();
+}
+/** Vertical gradient from the frame's own background colours, one stop per background row. */
+function bgGradient(c, tok, rgba, W, H, S, isBg) {
+  const g = c.createLinearGradient(0, 0, 0, H * S);
+  let any = false;
+  for (let r = 0; r < H; r++) {
+    for (let col = 0; col < W; col++) {
+      if (isBg(tok[r * W + col])) { g.addColorStop((r + 0.5) / H, px3(rgba, r * W + col)); any = true; break; }
+    }
+  }
+  return any ? g : null;
+}
+
+function drawBreakout(c, tok, rgba, S, W, H) {
+  box(c, 0, 0, W * S, H * S, '#000');
+  for (let r = 0; r < H; r++) for (let col = 0; col < W; col++) {
+    const t = tok[r * W + col], x = col * S, y = r * S;
+    if (t === 1) box(c, x, y, S, S, PAL.breakout.wall);
+    else if (t === 2) {                                   // brick: row colour plus a bevel
+      box(c, x, y, S, S, px3(rgba, r * W + col));
+      box(c, x, y, S, S * 0.16, 'rgba(255,255,255,.28)');
+      box(c, x, y + S * 0.84, S, S * 0.16, 'rgba(0,0,0,.32)');
+    } else if (t === 3) {                                 // paddle: rounded, with a highlight
+      box(c, x, y + S * 0.12, S, S * 0.76, PAL.breakout.paddle, S * 0.32);
+      box(c, x + S * 0.08, y + S * 0.2, S * 0.84, S * 0.22, 'rgba(255,255,255,.3)', S * 0.2);
+    }
+  }
+  for (let i = 0; i < W * H; i++) if (tok[i] >= 4) {
+    disc(c, (i % W + 0.5) * S, ((i / W | 0) + 0.5) * S, S * 0.42, PAL.breakout.ball, 'rgba(255,255,255,.8)');
+  }
+}
+
+function drawPong(c, tok, rgba, S, W, H) {
+  const g = bgGradient(c, tok, rgba, W, H, S, t => t === 0);
+  if (g) { c.fillStyle = g; c.fillRect(0, 0, W * S, H * S); }
+  for (let r = 0; r < H; r++) for (let col = 0; col < W; col++) {
+    const t = tok[r * W + col], x = col * S, y = r * S;
+    if (t === 1) box(c, x, y, S, S, PAL.pong.wall);
+    else if (t === 2 && r % 2 === 0) box(c, x + S * 0.28, y + S * 0.15, S * 0.44, S * 0.7, PAL.pong.net);
+    else if (t === 3 || t === 4) {                        // paddles, with a glow
+      const col = t === 3 ? PAL.pong.me : PAL.pong.cpu;
+      c.save(); c.shadowColor = col; c.shadowBlur = S * 1.1;
+      box(c, x, y, S, S, col, S * 0.35); c.restore();
+    }
+    else if (t === 5) box(c, x, y, S, S, PAL.pong.hud);
+    else if (t === 6 || t === 8) box(c, x + S * 0.12, y + S * 0.2, S * 0.76, S * 0.6, t === 6 ? PAL.pong.slotP : PAL.pong.slotC, S * 0.2);
+    else if (t === 7 || t === 9) box(c, x + S * 0.12, y + S * 0.2, S * 0.76, S * 0.6, t === 7 ? PAL.pong.me : PAL.pong.cpu, S * 0.2);
+  }
+  for (let i = 0; i < W * H; i++) if (tok[i] >= 10) {
+    disc(c, (i % W + 0.5) * S, ((i / W | 0) + 0.5) * S, S * 0.34, '#fff', 'rgba(255,255,255,.9)');
+  }
+}
+
+function drawFlappy(c, tok, rgba, S, W, H) {
+  const g = bgGradient(c, tok, rgba, W, H, S, t => t === 0);
+  if (g) { c.fillStyle = g; c.fillRect(0, 0, W * S, H * S); }
+  for (let r = 0; r < H; r++) for (let col = 0; col < W; col++) {
+    const t = tok[r * W + col], x = col * S, y = r * S, i = r * W + col;
+    if (t === 0 || t === 9 || t >= 11) continue;          // sky, beak, bird (drawn as a sprite)
+    if (t === 1) disc(c, x + S * 0.5, y + S * 0.85, S * 0.58, PAL.flappy.bush);
+    else if (t === 2) box(c, x, y, S, S, PAL.flappy.grass);
+    else if (t === 3 || t === 4) box(c, x, y, S, S, px3(rgba, i));
+    else if (t === 5) box(c, x, y, S, S, PAL.flappy.pipe);
+    else if (t === 6) box(c, x, y, S, S, PAL.flappy.pipeEdge);
+    else if (t === 7) box(c, x - S * 0.14, y, S * 1.28, S, PAL.flappy.pipeCap, S * 0.28);
+    else if (t === 8) box(c, x, y, S, S, PAL.flappy.hud);
+    else if (t === 10) box(c, x + S * 0.2, y + S * 0.15, S * 0.6, S * 0.7, PAL.flappy.marker, S * 0.2);
+  }
+  for (let i = 0; i < W * H; i++) if (tok[i] >= 11 && tok[i] <= 15) {
+    const r = i / W | 0, col = i % W, v = tok[i] - 13;    // speed -2..2
+    const cx = (col + 0.5) * S, cy = (r + 0.5) * S, R = S * 0.46;
+    disc(c, cx, cy, R, PAL.flappy.bird);
+    c.save(); c.translate(cx, cy); c.rotate(-v * 0.2);     // the wing tilts with the speed
+    c.beginPath(); c.ellipse(0, R * 0.22, R * 0.66, R * 0.32, 0, 0, 7);
+    c.fillStyle = 'rgba(255,255,255,.78)'; c.fill(); c.restore();
+    disc(c, cx + R * 0.34, cy - R * 0.3, R * 0.19, '#2b2b2b');
+    c.beginPath(); c.moveTo(cx + R * 0.55, cy - R * 0.02);
+    c.lineTo(cx + R * 1.5, cy - R * 0.22); c.lineTo(cx + R * 1.5, cy + R * 0.22); c.closePath();
+    c.fillStyle = PAL.flappy.beak; c.fill();
+  }
+}
+
+function drawDoom(c, tok, rgba, S, W, H) {
+  const g = bgGradient(c, tok, rgba, W, H, S, t => t === 0 || t === 1);
+  if (g) { c.fillStyle = g; c.fillRect(0, 0, W * S, H * S); }
+  for (let r = 0; r < H; r++) for (let col = 0; col < W; col++) {
+    const t = tok[r * W + col], x = col * S, y = r * S, i = r * W + col;
+    if (t <= 1) continue;                                 // ceiling, floor (gradient)
+    if (t <= 5) box(c, x, y, S, S, px3(rgba, i));         // raycast wall columns stay crisp
+    else if (t === 6) disc(c, x + S * 0.5, y + S * 0.5, S * 0.46, PAL.doomlite.enemy);
+    else if (t === 7) disc(c, x + S * 0.5, y + S * 0.5, S * 0.22, PAL.doomlite.eye);
+    else if (t === 8) box(c, x, y, S, S, PAL.doomlite.gun);
+    else if (t === 9) box(c, x, y, S, S, PAL.doomlite.gunHi);
+    else if (t === 10) disc(c, x + S * 0.5, y + S * 0.5, S * 0.52, 'rgba(255,210,70,.92)');
+    else if (t === 11) box(c, x, y, S, S, 'rgba(230,20,20,.55)');
+    else if (t === 12) box(c, x, y, S, S, PAL.doomlite.hud);
+    else if (t === 13) box(c, x, y, S, S, PAL.doomlite.health, S * 0.3);
+    else if (t === 14) box(c, x, y, S, S, PAL.doomlite.mapWall);
+    else if (t === 15) box(c, x, y, S, S, PAL.doomlite.mapFloor);
+    else if (t === 16) disc(c, x + S * 0.5, y + S * 0.5, S * 0.4, PAL.doomlite.mapEnemy);
+    else if (t >= 17) disc(c, x + S * 0.5, y + S * 0.5, S * 0.4, PAL.doomlite.mapPlayer);
+  }
+}
+
+function pacShape(c, x, y, S, heading, fill, withEye) {
+  const cx = x + S, cy = y + S, R = S * 0.96;
+  const a = [-Math.PI / 2, 0, Math.PI / 2, Math.PI][heading];
+  c.beginPath(); c.moveTo(cx, cy);
+  c.arc(cx, cy, R, a + 0.32, a - 0.32 + Math.PI * 2); c.closePath();
+  c.fillStyle = fill; c.fill();
+  if (withEye) disc(c, cx + Math.cos(a - Math.PI / 2) * R * 0.42, cy + Math.sin(a - Math.PI / 2) * R * 0.42, R * 0.15, PAL.pacman.eye);
+}
+function ghostShape(c, x, y, S, fill) {
+  const w = 2 * S, h = 2 * S, r = w / 2;
+  c.beginPath();
+  c.moveTo(x, y + h); c.lineTo(x, y + r); c.arc(x + r, y + r, r, Math.PI, 0); c.lineTo(x + w, y + h);
+  for (let k = 4; k > 0; k--) {                           // wavy skirt
+    c.lineTo(x + w * (k - 0.5) / 4, y + h - S * 0.26);
+    c.lineTo(x + w * (k - 1) / 4, y + h);
+  }
+  c.closePath(); c.fillStyle = fill; c.fill();
+  for (const ex of [0.3, 0.7]) {
+    disc(c, x + w * ex, y + h * 0.44, h * 0.17, '#fff');
+    disc(c, x + w * ex, y + h * 0.44, h * 0.09, PAL.pacman.pupil);
+  }
+}
+function drawPacman(c, tok, rgba, S, W, H) {
+  box(c, 0, 0, W * S, H * S, '#06060f');
+  for (let r = 0; r < H; r++) for (let col = 0; col < W; col++) {
+    const t = tok[r * W + col], x = col * S, y = r * S, i = r * W + col;
+    if (t === 0 || (t >= 12 && t <= 19)) continue;        // empty path, ghost and Pac-Man sprites
+    if (t === 1) box(c, x, y, S, S, px3(rgba, i), S * 0.16);
+    else if (t === 2) box(c, x, y, S, S, PAL.pacman.wallFill);
+    else if (t === 3) disc(c, x + S * 0.5, y + S * 0.5, S * 0.24, PAL.pacman.pellet);
+    else if (t === 4) box(c, x, y, S, S, PAL.pacman.hud);
+    else if (t === 9) pacShape(c, x, y, S * 0.5, 1, PAL.pacman.body);          // a life in the HUD
+    else if (t === 10 || t === 11) disc(c, x + S * 0.5, y + S * 0.5, S * 0.34, t === 10 ? PAL.pacman.ghostA : PAL.pacman.ghostB);
+  }
+  for (let i = 0; i < W * H; i++) {                       // ghosts: anchor is the lower-left cell
+    const t = tok[i], r = i / W | 0, col = i % W;
+    if (t >= 12 && t <= 15 && r % 2 === 1 && col % 2 === 0) {
+      ghostShape(c, col * S, (r - 1) * S, S, t <= 13 ? PAL.pacman.ghostA : PAL.pacman.ghostB);
+    }
+  }
+  const MOUTH = [[1, 0], [1, 1], [0, 1], [0, 0]];         // (dx, dy) per heading
+  for (let i = 0; i < W * H; i++) {                       // Pac-Man: the mouth cell carries the heading
+    const t = tok[i];
+    if (t >= 16) {
+      const r = i / W | 0, col = i % W, h = t - 16, [dx, dy] = MOUTH[h];
+      pacShape(c, (col - dx) * S, (r - dy) * S, S, h, PAL.pacman.body, true);
+    }
+  }
+}
+
+const RENDERERS = { breakout: drawBreakout, pong: drawPong, flappy: drawFlappy, doomlite: drawDoom, pacman: drawPacman };
+
+/** Plain per-cell upscale, for a game with no dedicated renderer. */
+function fallback(c, rgba, S, W, H) {
+  const off = new OffscreenCanvas(W, H);
+  off.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(rgba), W, H), 0, 0);
+  c.imageSmoothingEnabled = false;
+  c.drawImage(off, 0, 0, W * S, H * S);
+}
+
+/** Size the canvas so one grid cell lands on a whole number of device pixels and the CSS width
+ *  matches the backing store, so the browser never rescales the frame. */
+function fitCanvas() {
+  if (!wasm) return;
+  const W = wasm.width(), H = wasm.height();
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  const avail = Math.min(560, screen.parentElement.clientWidth - 32, 0.7 * window.innerHeight * W / H);
+  scale = Math.max(3, Math.floor(avail * dpr / W));
+  screen.width = W * scale; screen.height = H * scale;
+  screen.style.width = `${(W * scale / dpr).toFixed(1)}px`;
+  ctx.imageSmoothingEnabled = true;
+}
 
 async function load(env) {
   const gen = ++generation;
@@ -66,9 +287,7 @@ async function load(env) {
   const str = i => new TextDecoder().decode(new Uint8Array(e.memory.buffer, e.name_ptr(i), e.name_len(i)));
   wasm = e;
   game = str(0);
-  screen.width = e.width();
-  screen.height = e.height();
-  screen.style.width = `min(100%, 560px, ${(70 * e.width() / e.height()).toFixed(1)}vh)`; // tall games fit the screen
+  fitCanvas();
   $('loops').innerHTML = Array.from({ length: e.max_loops() }, (_, i) => `<option value="${i + 1}">${i + 1} loop${i ? 's' : ''}</option>`).join('');
   $('pad').innerHTML = '';
   for (const [k, label] of KEYS[game] ?? []) {
@@ -90,8 +309,11 @@ function press(k) {
 }
 
 function draw() {
-  const px = new Uint8ClampedArray(wasm.memory.buffer, wasm.rgba(), wasm.width() * wasm.height() * 4);
-  ctx.putImageData(new ImageData(px, wasm.width(), wasm.height()), 0, 0);
+  const W = wasm.width(), H = wasm.height();
+  const rgba = new Uint8Array(wasm.memory.buffer, wasm.rgba(), W * H * 4);
+  const tok = wasm.grid ? new Uint8Array(wasm.memory.buffer, wasm.grid(), W * H) : null;
+  const render = tok && RENDERERS[game];
+  if (render) render(ctx, tok, rgba, scale, W, H); else fallback(ctx, rgba, scale, W, H);
   const who = wasm.human() ? 'you' : wasm.learning() ? 'stream-x LEARNING' : 'pretrained stream-x agent';
   $('stats').textContent =
     `score ${wasm.score()}  ${WON[game] ?? 'wins'} ${wasm.wins()}  lives ${wasm.lives()}  episode ${wasm.episode()}  | ${who}\n` +
@@ -125,6 +347,7 @@ addEventListener('keydown', ev => {
   press(k);
 });
 screen.addEventListener('pointerdown', () => window.focus()); // keys reach the page inside the Space's iframe
+addEventListener('resize', fitCanvas);
 $('agent').onclick = () => press('g');
 $('learn').onclick = () => press('l');
 $('relearn').onclick = () => press('r');
